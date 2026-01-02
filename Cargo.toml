@@ -1,0 +1,39 @@
+[package]
+name = "docsfinder"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+
+tokio = {version = "1.48", features = ["rt", "rt-multi-thread"]}
+tokio-util = {version = "0.7", features = ["io"]}
+
+reqwest = {version = "0.12", features=["stream"]}
+bytes = "1.11"
+
+#rustdoc-types = {git = "https://github.com/rust-lang/rustdoc-types"}
+# NOTE: 0.57 / newer versions do not work yet
+# breaking change with adding an additional field that is not in crates yet.
+rustdoc-types = "0.56"
+
+serde_json = "1.0"
+
+ruzstd = "0.8.2"
+
+futures-util = "0.3"
+
+async-compression = {version = "0.4", features = ["all"]}
+
+crates_io_api = {git = "https://github.com/theduke/crates-io-api"}
+chrono = {version = "0.4"}
+
+serde = {version = "1.0", features=["derive"]}
+
+ratatui = {version = "0.30"}
+color-eyre = "0.6"
+textwrap = "0.16"
+
+open = "5.3"
+
+millisecond = "0.15"
+humantime = "2.3"
