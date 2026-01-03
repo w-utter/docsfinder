@@ -12,7 +12,7 @@ pub struct Receiver {
 }
 
 impl Client {
-    pub fn new(user_agent: &str) -> reqwest::Result<(Self, Receiver)> {
+    pub fn new(user_agent: String) -> reqwest::Result<(Self, Receiver)> {
         let crates_client = reqwest::Client::builder().user_agent(user_agent).build()?;
 
         let (tx, rx) = mpsc::channel();
@@ -70,9 +70,6 @@ impl Client {
     async fn new_entry(&self) {
         const DOCS_RANDOM_URL: &str = "https://docs.rs/releases/search?query=&i-am-feeling-lucky=1";
 
-        use std::time::Duration;
-        const TIMEOUT_DURATION: Duration = Duration::from_secs(30);
-
         match tokio::time::timeout(TIMEOUT_DURATION, self.inner.get(DOCS_RANDOM_URL).send()).await {
             Err(_) => {
                 let _ = self.err_tx.send(Err(InfoErr::Timeout));
@@ -84,6 +81,9 @@ impl Client {
         }
     }
 }
+
+use std::time::Duration;
+pub(crate) const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 
 impl Receiver {
     pub fn recv(&self) -> Option<Result<Info, InfoErr>> {

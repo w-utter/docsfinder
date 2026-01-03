@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         buf.trim().to_string()
     });
 
-    let (client, info_rx) = Client::new(&user)?;
+    let (client, info_rx) = Client::new(user)?;
 
     // FIXME: have this be changeable
     let max_recv = 10;

@@ -23,8 +23,18 @@ pub(crate) async fn get_crate_info(
     crates_url: String,
     crates_client: &reqwest::Client,
 ) -> Result<Info, InfoErr> {
-    let res = crates_client.get(crates_url).send().await?;
-    let krate = res.text().await?;
+    async fn fetch_info(
+        crates_url: String,
+        crates_client: &reqwest::Client,
+     ) -> Result<String, InfoErr> {
+        let res = crates_client.get(crates_url).send().await?;
+        Ok(res.text().await?)
+    }
+
+    let krate = match tokio::time::timeout(crate::client::TIMEOUT_DURATION, fetch_info(crates_url, crates_client)).await {
+        Err(_) => return Err(InfoErr::Timeout),
+        Ok(res) => res?,
+    };
 
     if let Ok(err) = serde_json::from_str::<crates_io_api::ApiErrors>(&krate) {
         return Err(InfoErr::Api(err));

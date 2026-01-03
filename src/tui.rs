@@ -67,9 +67,10 @@ impl SendRecvState {
         max_screen_entries: usize,
         seen_crates: &mut HashSet<String>,
         filters: &Filters,
-    ) -> Option<Info> {
+    ) -> Result<Info, bool> {
         if self.received_count >= max_screen_entries {
-            return None;
+            self.inflight_count = 0;
+            return Err(false);
         }
 
         let to_send = max_screen_entries
@@ -82,34 +83,71 @@ impl SendRecvState {
 
         self.inflight_count += to_send;
 
-        let info = self.info_rx.recv()?;
-        self.inflight_count -= 1;
+        let info = self.info_rx.recv().ok_or(false)?;
+
+        self.inflight_count = self.inflight_count.checked_sub(1).unwrap_or_default();
 
         let info = match info {
             Ok(info) => info,
             Err(_e) => {
                 //FIXME: log info err
-                return None;
+                return Err(true);
             }
         };
 
         if seen_crates.get(&info.name).is_some() {
             // FIXME: log duplicate?
-            return None;
+            return Err(true);
         }
         seen_crates.insert(info.name.clone());
 
         if let Some(_reason) = filters.filter(&info) {
             // FIXME: log skipped
-            return None;
+            return Err(true);
         }
-
-        self.received_count += 1;
-        Some(info)
+        Ok(info)
     }
 
     fn set_received_count(&mut self, received: usize) {
         self.received_count = received;
+    }
+
+    fn update_iter<'a>(&'a mut self,
+        max_screen_entries: usize,
+        seen_crates: &'a mut HashSet<String>,
+        filters: &'a Filters,
+                   ) -> UpdateIter<'a> {
+        UpdateIter {
+            state: self,
+            max_screen_entries,
+            seen_crates,
+            filters,
+            has_update: false,
+        }
+    }
+}
+
+struct UpdateIter<'a> {
+    state: &'a mut SendRecvState,
+    seen_crates: &'a mut HashSet<String>,
+    filters: &'a Filters,
+    max_screen_entries: usize,
+    has_update: bool,
+}
+
+impl <'a> Iterator for UpdateIter<'a> {
+    type Item = Info;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.state.update(self.max_screen_entries, &mut self.seen_crates, &self.filters) {
+                Ok(info) => {
+                    self.has_update = true;
+                    return Some(info);
+                }
+                Err(true) => self.has_update = true,
+                Err(false) => return None,
+            }
+        }
     }
 }
 
@@ -226,49 +264,38 @@ impl Entries {
     fn mark_for_replacement(
         &mut self,
         idx: usize,
-        backups: &mut Vec<Info>,
         send_ctx: &mut SendRecvState,
     ) {
         match self.inner.get_mut(idx) {
             None | Some(Err(_)) => (),
             Some(res) => {
-                if let Some(info) = backups.pop() {
-                    *res = Ok(info);
-                } else {
-                    use chrono::{DateTime, Utc};
-                    const DUMMY: Info = Info {
-                        keywords: vec![],
-                        categories: vec![],
-                        last_update: DateTime::<Utc>::MIN_UTC,
-                        created_at: DateTime::<Utc>::MIN_UTC,
-                        description: None,
-                        version: String::new(),
-                        stable_version: None,
-                        downloads: 0,
-                        recent_downloads: None,
-                        name: String::new(),
-                        repo_link: None,
-                        docs_link: None,
-                    };
+                use chrono::{DateTime, Utc};
+                const DUMMY: Info = Info {
+                    keywords: vec![],
+                    categories: vec![],
+                    last_update: DateTime::<Utc>::MIN_UTC,
+                    created_at: DateTime::<Utc>::MIN_UTC,
+                    description: None,
+                    version: String::new(),
+                    stable_version: None,
+                    downloads: 0,
+                    recent_downloads: None,
+                    name: String::new(),
+                    repo_link: None,
+                    docs_link: None,
+                };
 
-                    *res = match res {
-                        Ok(r) => Err(Some(core::mem::replace(r, DUMMY))),
-                        _ => unreachable!(),
-                    };
-
-                    send_ctx.set_received_count(self.entries_len());
-                }
+                *res = match res {
+                    Ok(r) => Err(Some(core::mem::replace(r, DUMMY))),
+                    _ => unreachable!(),
+                };
+                send_ctx.set_received_count(self.entries_len());
             }
         }
     }
 
-    fn clear_all(&mut self, backups: &mut Vec<Info>, send_ctx: &mut SendRecvState) {
+    fn clear_all(&mut self, send_ctx: &mut SendRecvState) {
         for entry in self.inner.iter_mut() {
-            if let Some(info) = backups.pop() {
-                *entry = Ok(info);
-                continue;
-            }
-
             if entry.is_err() {
                 continue;
             }
@@ -308,6 +335,25 @@ impl Entries {
             _ => None,
         }
     }
+
+    fn resize(&mut self, count: usize) {
+        if count > self.len() {
+            let diff = count - self.len();
+            self.inner.extend(vec![Err(None); diff]);
+        } else {
+            self.inner.sort_by(|a, b| {
+                use std::cmp::Ordering;
+                match (a, b) {
+                    (Ok(_), Ok(_)) | (Err(Some(_)), Err(Some(_))) | (Err(None), Err(None)) => Ordering::Equal,
+                    (Ok(_), _) => Ordering::Less,
+                    (_, Ok(_)) => Ordering::Greater,
+                    (Err(Some(_)), _) => Ordering::Less,
+                    (_, Err(Some(_))) => Ordering::Less,
+                }
+            });
+            self.inner.truncate(count);
+        }
+    }
 }
 
 use ratatui::widgets::{Table, TableState};
@@ -318,7 +364,6 @@ pub struct App {
     entries: Entries,
     table_state: TableState,
     colors: TableColors,
-    backup_info: Vec<Info>,
     seen_crates: HashSet<String>,
     filters: Filters,
     prev_max_info_width: usize,
@@ -371,7 +416,7 @@ impl CurrentMenu {
                         .keywords_text
                         .split([' ', ','])
                         .filter(|w| !w.is_empty())
-                        .map(|w| w.to_string())
+                        .map(|w| w.to_lowercase())
                         .collect::<HashSet<_>>()
                 }
                 SelectedFilter::Duration => {
@@ -524,7 +569,7 @@ impl Filters {
 
         {
             for word in info.name.split(['-', '_']).filter(|w| !w.is_empty()) {
-                if self.keywords.contains(word) {
+                if self.keywords.contains(&word.to_lowercase()) {
                     return Some(FilterReason::Keyword(word));
                 }
             }
@@ -532,30 +577,30 @@ impl Filters {
             if let Some(desc) = info.description.as_ref() {
                 for word in desc.split_whitespace() {
                     for span in word.split(['-', '_']).filter(|w| !w.is_empty()) {
-                        if self.keywords.contains(span) {
+                        if self.keywords.contains(&span.to_lowercase()) {
                             return Some(FilterReason::Keyword(span));
                         }
                     }
 
-                    if self.keywords.contains(word) {
+                    if self.keywords.contains(&word.to_lowercase()) {
                         return Some(FilterReason::Keyword(word));
                     }
                 }
             }
 
             for kw in info.keywords.iter() {
-                if self.keywords.contains(kw) {
+                if self.keywords.contains(&kw.to_lowercase()) {
                     return Some(FilterReason::Keyword(kw));
                 }
             }
 
             for cat in info.categories.iter() {
-                for sub in cat.split("::") {
-                    if self.keywords.contains(sub) {
+                for sub in cat.split("::").filter(|s| !s.is_empty()) {
+                    if self.keywords.contains(&sub.to_lowercase()) {
                         return Some(FilterReason::Keyword(sub));
                     }
                 }
-                if self.keywords.contains(cat) {
+                if self.keywords.contains(&cat.to_lowercase()) {
                     return Some(FilterReason::Keyword(cat));
                 }
             }
@@ -619,7 +664,6 @@ impl App {
             entries: Entries::new(max_screen_entries),
             table_state: ratatui::widgets::TableState::default(),
             colors: TableColors::new(&tailwind::STONE),
-            backup_info: vec![],
             seen_crates: HashSet::default(),
             filters: Filters::default(),
             prev_max_info_width: 0,
@@ -640,17 +684,18 @@ impl App {
 
     fn update_loop(&mut self) -> Result<bool> {
         loop {
-            let mut has_update = false;
+            let mut upd_iter = self.send_recv_state.update_iter(self.max_screen_entries, &mut self.seen_crates, &self.filters);
 
-            while let Some(info) = self.send_recv_state.update(
-                self.max_screen_entries,
-                &mut self.seen_crates,
-                &self.filters,
-            ) {
-                has_update = true;
-                if let Some(info) = self.entries.insert_info(info) {
-                    self.backup_info.push(info);
+            while let Some(info) = upd_iter.next() {
+                if self.entries.insert_info(info).is_some() {
+                    upd_iter.state.received_count += 1;
                 }
+            }
+
+            let has_update = upd_iter.has_update;
+
+            if has_update {
+                self.send_recv_state.received_count = self.entries.entries_len();
             }
 
             use std::time::Duration;
@@ -684,7 +729,6 @@ impl App {
                                     if let Some(idx) = self.table_state.selected() {
                                         self.entries.mark_for_replacement(
                                             idx,
-                                            &mut self.backup_info,
                                             &mut self.send_recv_state,
                                         );
 
@@ -702,7 +746,6 @@ impl App {
                                 KeyCode::Char('g') | KeyCode::Char('o') => self.goto_link(),
                                 KeyCode::Char('r') => {
                                     self.entries.clear_all(
-                                        &mut self.backup_info,
                                         &mut self.send_recv_state,
                                     );
                                     self.table_state.select(None);
@@ -722,6 +765,16 @@ impl App {
                                 KeyCode::Char('h') => {
                                     self.hide_footer = !self.hide_footer;
                                 }
+                                KeyCode::Char('n') => {
+                                    self.max_screen_entries += 1;
+                                    self.entries.resize(self.max_screen_entries);
+                                    self.send_recv_state.received_count = self.entries.entries_len();
+                                }
+                                KeyCode::Char('m') => {
+                                    self.max_screen_entries -= 1;
+                                    self.entries.resize(self.max_screen_entries);
+                                    self.send_recv_state.received_count = self.entries.entries_len();
+                                }
                                 _ => {}
                             }
                         }
@@ -736,7 +789,6 @@ impl App {
                                         self.menu_state.current = None;
                                         self.entries.mark_for_replacement(
                                             idx,
-                                            &mut self.backup_info,
                                             &mut self.send_recv_state,
                                         );
 
@@ -771,7 +823,6 @@ impl App {
                                 KeyCode::Char('r') => {
                                     self.menu_state.current = None;
                                     self.entries.clear_all(
-                                        &mut self.backup_info,
                                         &mut self.send_recv_state,
                                     );
                                     self.table_state.select(None);
@@ -975,6 +1026,13 @@ impl App {
             Some((CurrentMenu::Filters(_), InputMode::Editing))
         ) {
             footer_info.push_str(", Enter: update");
+        }
+
+        if matches!(
+            self.menu_state.current,
+            None
+        ) {
+            footer_info.push_str(&format!(", current entries: {} (n: inc, m: dec)", self.max_screen_entries));
         }
 
         let footer = Paragraph::new(Text::from(footer_info.as_str()))
