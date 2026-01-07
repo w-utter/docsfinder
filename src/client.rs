@@ -1,10 +1,24 @@
-use crate::crates_api::{self, Info, InfoErr};
+use crate::crates_api::{Info, InfoErr};
 use std::sync::mpsc;
+use std::sync::Arc;
+
+fn create_config() -> tokio_rustls::rustls::ClientConfig {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth()
+}
 
 #[derive(Clone)]
 pub struct Client {
-    inner: reqwest::Client,
+    discovery_pool: Arc<connection_pool::ConnectionPool<crate::discovery::DiscoveryManager>>,
+    crates_pool: Arc<connection_pool::ConnectionPool<crate::crates_api::CratesManager>>,
+    seen_crates: Arc<lockfree::set::Set<String>>,
+
     err_tx: mpsc::Sender<Result<Info, InfoErr>>,
+
+    user_agent: Arc<str>,
 }
 
 pub struct Receiver {
@@ -12,40 +26,42 @@ pub struct Receiver {
 }
 
 impl Client {
-    pub fn new(user_agent: String) -> reqwest::Result<(Self, Receiver)> {
-        let crates_client = reqwest::Client::builder().user_agent(user_agent).build()?;
-
+    pub async fn new(user_agent: String) -> reqwest::Result<(Self, Receiver)> {
         let (tx, rx) = mpsc::channel();
         let err_tx = tx.clone();
 
-        let redirect_scheme = reqwest::redirect::Policy::custom(move |attempt| {
-            let crates_client = crates_client.clone();
-            let url = attempt.url();
+        let client = {
+            let config = Arc::new(create_config());
 
-            let Some((crate_name, _)) = crates_info_from_url_path(url.path()) else {
-                let _ = tx.send(Err(InfoErr::NotFound));
-                return attempt.stop();
-            };
 
-            let crates_url = format!("https://crates.io/api/v1/crates/{crate_name}");
+            let discovery_manager = crate::discovery::DiscoveryManager::new(config.clone());
 
-            let tx_2 = tx.clone();
+            let discovery_pool = connection_pool::ConnectionPool::new(
+                Some(tokio::sync::Semaphore::MAX_PERMITS),
+                None,
+                None,
+                None,
+                discovery_manager,
+            );
 
-            tokio::task::spawn(async move {
-                let info = crates_api::get_crate_info(crates_url, &crates_client).await;
-                let _ = tx_2.send(info);
-            });
+            let crates_manager = crate::crates_api::CratesManager::new(config.clone());
+            let crates_pool = connection_pool::ConnectionPool::new(
+                Some(tokio::sync::Semaphore::MAX_PERMITS),
+                None,
+                None,
+                None,
+                crates_manager,
+            );
 
-            attempt.stop()
-        });
+            let seen_crates = Arc::new(lockfree::set::Set::<String>::new());
 
-        let redirect_client = reqwest::Client::builder()
-            .redirect(redirect_scheme)
-            .build()?;
-
-        let client = Self {
-            inner: redirect_client,
-            err_tx,
+            Self {
+                discovery_pool,
+                crates_pool,
+                seen_crates,
+                err_tx,
+                user_agent: user_agent.into(),
+            }
         };
 
         let receiver = Receiver { inner: rx };
@@ -59,31 +75,70 @@ impl Client {
                 break;
             };
 
-            let this = self.clone();
+            let discovery_pool = self.discovery_pool.clone();
+            let seen_crates = self.seen_crates.clone();
+            let crates_pool = self.crates_pool.clone();
+            let user_agent = self.user_agent.clone();
+            let err_tx = self.err_tx.clone();
 
             tokio::task::spawn(async move {
-                this.new_entry().await;
+                let mut conn = Self::get_connection(&discovery_pool).await;
+
+                loop {
+                    let crate_name = match conn.get_crate_name().await {
+                        Ok(Some(url)) => url,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            conn = Self::get_connection(&discovery_pool).await;
+                            continue;
+                        }
+                    };
+
+                    if seen_crates.contains(&crate_name) {
+                        continue;
+                    }
+
+                    let _ = seen_crates.insert(crate_name.clone());
+
+                    let crates_pool = crates_pool;
+
+                    tokio::task::spawn(async move {
+                        async fn get_body(crates_pool: Arc<connection_pool::ConnectionPool<crate::crates_api::CratesManager>>, name: String, user_agent: &str) -> crate::crates_api::Info {
+                            let mut conn = Client::get_connection(&crates_pool).await;
+
+                            loop {
+                                match conn.get_crate(&name, user_agent).await {
+                                    Ok(b) => return b,
+                                    Err(e) => {
+                                        println!("err: {e:?}");
+                                        conn = Client::get_connection(&crates_pool).await;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        let body = get_body(crates_pool, crate_name, &user_agent).await;
+                        let _ = err_tx.send(Ok(body));
+                    });
+                    break;
+                }
             });
         }
     }
 
-    async fn new_entry(&self) {
-        const DOCS_RANDOM_URL: &str = "https://docs.rs/releases/search?query=&i-am-feeling-lucky=1";
-
-        match tokio::time::timeout(TIMEOUT_DURATION, self.inner.get(DOCS_RANDOM_URL).send()).await {
-            Err(_) => {
-                let _ = self.err_tx.send(Err(InfoErr::Timeout));
+    async fn get_connection<M: connection_pool::ConnectionManager + 'static>(pool: &Arc<connection_pool::ConnectionPool<M>>) -> connection_pool::ManagedConnection<M> {
+        loop {
+            match pool.clone().get_connection().await {
+                Err(_) => (),
+                Ok(c) => {
+                    return c;
+                }
             }
-            Ok(Err(e)) => {
-                let _ = self.err_tx.send(Err(InfoErr::Http(e)));
-            }
-            Ok(Ok(_)) => (),
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
 }
-
-use std::time::Duration;
-pub(crate) const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
 
 impl Receiver {
     pub fn recv(&self) -> Option<Result<Info, InfoErr>> {
@@ -98,9 +153,3 @@ impl Receiver {
     }
 }
 
-fn crates_info_from_url_path(path: &str) -> Option<(&str, &str)> {
-    let mut iter = path.split("/").filter(|s| !s.is_empty());
-    let name = iter.next()?;
-    let version = iter.next()?;
-    Some((name, version))
-}

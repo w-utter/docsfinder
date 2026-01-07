@@ -65,7 +65,6 @@ impl SendRecvState {
     pub fn update(
         &mut self,
         max_screen_entries: usize,
-        seen_crates: &mut HashSet<String>,
         filters: &Filters,
     ) -> Result<Info, bool> {
         if self.received_count >= max_screen_entries {
@@ -95,12 +94,6 @@ impl SendRecvState {
             }
         };
 
-        if seen_crates.get(&info.name).is_some() {
-            // FIXME: log duplicate?
-            return Err(true);
-        }
-        seen_crates.insert(info.name.clone());
-
         if let Some(_reason) = filters.filter(&info) {
             // FIXME: log skipped
             return Err(true);
@@ -114,13 +107,11 @@ impl SendRecvState {
 
     fn update_iter<'a>(&'a mut self,
         max_screen_entries: usize,
-        seen_crates: &'a mut HashSet<String>,
         filters: &'a Filters,
                    ) -> UpdateIter<'a> {
         UpdateIter {
             state: self,
             max_screen_entries,
-            seen_crates,
             filters,
             has_update: false,
         }
@@ -129,7 +120,6 @@ impl SendRecvState {
 
 struct UpdateIter<'a> {
     state: &'a mut SendRecvState,
-    seen_crates: &'a mut HashSet<String>,
     filters: &'a Filters,
     max_screen_entries: usize,
     has_update: bool,
@@ -139,7 +129,7 @@ impl <'a> Iterator for UpdateIter<'a> {
     type Item = Info;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.state.update(self.max_screen_entries, &mut self.seen_crates, &self.filters) {
+            match self.state.update(self.max_screen_entries, &self.filters) {
                 Ok(info) => {
                     self.has_update = true;
                     return Some(info);
@@ -265,6 +255,7 @@ impl Entries {
         &mut self,
         idx: usize,
         send_ctx: &mut SendRecvState,
+        overflow: &mut Vec<Info>,
     ) {
         match self.inner.get_mut(idx) {
             None | Some(Err(_)) => (),
@@ -285,18 +276,26 @@ impl Entries {
                     docs_link: None,
                 };
 
-                *res = match res {
-                    Ok(r) => Err(Some(core::mem::replace(r, DUMMY))),
-                    _ => unreachable!(),
-                };
+                if let Some(info) = overflow.pop() {
+                    *res = Ok(info);
+                } else {
+                    *res = match res {
+                        Ok(r) => Err(Some(core::mem::replace(r, DUMMY))),
+                        _ => unreachable!(),
+                    };
+                }
+
                 send_ctx.set_received_count(self.entries_len());
             }
         }
     }
 
-    fn clear_all(&mut self, send_ctx: &mut SendRecvState) {
+    fn clear_all(&mut self, send_ctx: &mut SendRecvState, overflow: &mut Vec<Info>) {
         for entry in self.inner.iter_mut() {
-            if entry.is_err() {
+            if let Some(info) = overflow.pop() {
+                *entry = Ok(info);
+                continue;
+            } else if entry.is_err() {
                 continue;
             }
 
@@ -362,9 +361,9 @@ pub struct App {
     send_recv_state: SendRecvState,
     max_screen_entries: usize,
     entries: Entries,
+    overflow: Vec<Info>,
     table_state: TableState,
     colors: TableColors,
-    seen_crates: HashSet<String>,
     filters: Filters,
     prev_max_info_width: usize,
     menu_state: MenuState,
@@ -664,11 +663,11 @@ impl App {
             entries: Entries::new(max_screen_entries),
             table_state: ratatui::widgets::TableState::default(),
             colors: TableColors::new(&tailwind::STONE),
-            seen_crates: HashSet::default(),
             filters: Filters::default(),
             prev_max_info_width: 0,
             menu_state: MenuState::default(),
             hide_footer: false,
+            overflow: vec![],
         }
     }
 
@@ -684,10 +683,12 @@ impl App {
 
     fn update_loop(&mut self) -> Result<bool> {
         loop {
-            let mut upd_iter = self.send_recv_state.update_iter(self.max_screen_entries, &mut self.seen_crates, &self.filters);
+            let mut upd_iter = self.send_recv_state.update_iter(self.max_screen_entries, &self.filters);
 
             while let Some(info) = upd_iter.next() {
-                if self.entries.insert_info(info).is_some() {
+                if let Some(overflow) = self.entries.insert_info(info) {
+                    self.overflow.push(overflow);
+                } else {
                     upd_iter.state.received_count += 1;
                 }
             }
@@ -703,7 +704,7 @@ impl App {
                 return Ok(false);
             }
 
-            if !event::poll(Duration::from_millis(100))? {
+            if self.send_recv_state.received_count != self.entries.len() && !event::poll(Duration::from_millis(100))? {
                 continue;
             }
 
@@ -730,6 +731,7 @@ impl App {
                                         self.entries.mark_for_replacement(
                                             idx,
                                             &mut self.send_recv_state,
+                                            &mut self.overflow,
                                         );
 
                                         if self.entries.is_first_entry(idx) {
@@ -747,6 +749,7 @@ impl App {
                                 KeyCode::Char('r') => {
                                     self.entries.clear_all(
                                         &mut self.send_recv_state,
+                                        &mut self.overflow,
                                     );
                                     self.table_state.select(None);
                                 }
@@ -790,6 +793,7 @@ impl App {
                                         self.entries.mark_for_replacement(
                                             idx,
                                             &mut self.send_recv_state,
+                                            &mut self.overflow,
                                         );
 
                                         if self.entries.is_first_entry(idx) {
@@ -824,6 +828,7 @@ impl App {
                                     self.menu_state.current = None;
                                     self.entries.clear_all(
                                         &mut self.send_recv_state,
+                                        &mut self.overflow,
                                     );
                                     self.table_state.select(None);
                                 }
@@ -913,12 +918,8 @@ impl App {
                 };
 
                 let total_width = usize::try_from(area.width).unwrap();
-                let desc_width = total_width
-                    - self.prev_max_info_width
-                    - self.entries.longest_keyword_len
-                    - self.entries.longest_category_len
-                    - column_count
-                    - 3;
+
+                let desc_width = total_width.checked_sub(self.prev_max_info_width + self.entries.longest_keyword_len + self.entries.longest_category_len + column_count + 3).unwrap_or_default();
 
                 let max_newlines = 2;
 

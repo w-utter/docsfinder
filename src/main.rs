@@ -1,6 +1,10 @@
+#![feature(impl_trait_in_assoc_type)]
+
 mod client;
 mod crates_api;
 mod tui;
+mod hyper_tls;
+mod discovery;
 use client::{Client, Receiver};
 pub use crates_api::InfoErr;
 pub use tui::FilterReason;
@@ -29,9 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         buf.trim().to_string()
     });
 
-    let (client, info_rx) = Client::new(user)?;
+    let (client, info_rx) = rt.block_on(async move { Client::new(user).await })?;
 
-    // FIXME: have this be changeable
     let max_recv = 10;
 
     use tokio::sync::mpsc;

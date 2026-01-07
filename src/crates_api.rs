@@ -1,10 +1,27 @@
 #[derive(Debug)]
 pub enum InfoErr {
+    #[allow(unused)]
     Http(reqwest::Error),
+    #[allow(unused)]
+    Hyper(hyper::Error),
+    #[allow(unused)]
     Api(crates_io_api::ApiErrors),
+    #[allow(unused)]
+    Io(std::io::Error),
+    #[allow(unused)]
     Serde(serde_json::Error),
     NotFound,
     Timeout,
+}
+
+impl std::error::Error for InfoErr {
+
+}
+
+impl std::fmt::Display for InfoErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as std::fmt::Debug>::fmt(self, f)
+    }
 }
 
 impl From<reqwest::Error> for InfoErr {
@@ -19,31 +36,16 @@ impl From<serde_json::Error> for InfoErr {
     }
 }
 
-pub(crate) async fn get_crate_info(
-    crates_url: String,
-    crates_client: &reqwest::Client,
-) -> Result<Info, InfoErr> {
-    async fn fetch_info(
-        crates_url: String,
-        crates_client: &reqwest::Client,
-     ) -> Result<String, InfoErr> {
-        let res = crates_client.get(crates_url).send().await?;
-        Ok(res.text().await?)
+impl From<hyper::Error> for InfoErr {
+    fn from(f: hyper::Error) -> Self {
+        Self::Hyper(f)
     }
+}
 
-    let krate = match tokio::time::timeout(crate::client::TIMEOUT_DURATION, fetch_info(crates_url, crates_client)).await {
-        Err(_) => return Err(InfoErr::Timeout),
-        Ok(res) => res?,
-    };
-
-    if let Ok(err) = serde_json::from_str::<crates_io_api::ApiErrors>(&krate) {
-        return Err(InfoErr::Api(err));
-    };
-
-    let parsed: crates_io_api::CrateResponse = serde_json::from_str(&krate)?;
-    let info: Info = parsed.into();
-
-    Ok(info)
+impl From<std::io::Error> for InfoErr {
+    fn from(f: std::io::Error) -> Self {
+        Self::Io(f)
+    }
 }
 
 use chrono::{DateTime, Utc};
@@ -107,5 +109,73 @@ impl From<crates_io_api::Crate> for Info {
 impl From<crates_io_api::CrateResponse> for Info {
     fn from(f: crates_io_api::CrateResponse) -> Info {
         f.crate_data.into()
+    }
+}
+
+use std::sync::{LazyLock, Arc, atomic::{Ordering, AtomicBool}};
+use tokio_rustls::rustls::ClientConfig;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+
+
+#[derive(Clone)]
+pub struct CratesManager {
+    config: Arc<tokio_rustls::rustls::ClientConfig>,
+}
+
+impl CratesManager {
+    // part of url before the crate name
+    const CRATES_URL: &str = "https://crates.io/api/v1/crates/";
+    const HTTPS_PORT: u16 = 443;
+
+    pub fn new(config: Arc<ClientConfig>) -> Self {
+        Self {
+            config
+        }
+    }
+}
+
+pub(crate) static PARSED_CRATES_URL: LazyLock<hyper::Uri> = LazyLock::new(|| hyper::Uri::from_static(CratesManager::CRATES_URL));
+pub(crate) static CRATES_HOSTNAME: LazyLock<rustls_pki_types::ServerName<'static>> = LazyLock::new(|| rustls_pki_types::ServerName::try_from(PARSED_CRATES_URL.host().unwrap_or_default().to_string()).unwrap());
+
+impl connection_pool::ConnectionManager for CratesManager {
+    type Connection = crate::discovery::Connection;
+    type Error = InfoErr;
+    type CreateFut = impl Future<Output = Result<Self::Connection, Self::Error>> + Send;
+    type ValidFut<'a> = impl Future<Output = bool> + Send + 'a;
+    
+    fn create_connection(&self) -> Self::CreateFut {
+        let config = self.config.clone();
+        async {
+            let parsed_url = &PARSED_CRATES_URL;
+            let host = parsed_url.host().unwrap_or_default();
+
+            let connector = TlsConnector::from(config);
+            let stream = TcpStream::connect((host, Self::HTTPS_PORT)).await?;
+            let stream = connector.connect(CRATES_HOSTNAME.clone(), stream).await?;
+
+            let io = crate::hyper_tls::Io::new(stream);
+            let (inner, conn) = hyper::client::conn::http1::handshake(io).await?;
+            let valid = Arc::new(AtomicBool::from(true));
+
+            let is_valid = valid.clone();
+            tokio::task::spawn(async move {
+                if let Err(err) = conn.await {
+                    is_valid.store(false, Ordering::SeqCst);
+                    println!("Connection failed: {:?}", err);
+                }
+            });
+
+            Ok(crate::discovery::Connection {
+                inner,
+                valid,
+            })
+        }
+    }
+
+    fn is_valid<'a>(&'a self, conn: &'a mut Self::Connection) -> Self::ValidFut<'a> {
+        async {
+            conn.valid.load(Ordering::Relaxed) && !conn.inner.is_closed()
+        }
     }
 }
