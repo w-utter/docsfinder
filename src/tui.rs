@@ -459,13 +459,21 @@ impl CurrentMenu {
     ) {
         match self {
             Self::Filters(kind) => {
+                let keywords_available_y = area.height.checked_sub(1 + 1 + 3).unwrap_or_default();
+                let keywords_available_x = area.width.checked_sub(2).unwrap_or_default();
+
+                let lines = textwrap::wrap(this.filters.keywords_text.as_str(), keywords_available_x as usize).len() as u16;
+
+                let keywords_height = core::cmp::max(core::cmp::min(keywords_available_y, lines + 2), 3);
+
                 let vertical = Layout::vertical([
                     Constraint::Length(1),
-                    Constraint::Length(3),
+                    Constraint::Length(keywords_height),
                     Constraint::Length(1),
                     Constraint::Length(3),
                     Constraint::Fill(1),
                 ]);
+
                 let [
                     keywords_area,
                     keywords_input_area,
@@ -478,6 +486,7 @@ impl CurrentMenu {
                 frame.render_widget(help_message, keywords_area);
 
                 let input = Paragraph::new(this.filters.keywords_text.as_str())
+                    .wrap(Wrap {trim: true})
                     .style(match (&input_mode, kind) {
                         (InputMode::Normal, SelectedFilter::Keywords) => Style::default()
                             .add_modifier(Modifier::REVERSED)
