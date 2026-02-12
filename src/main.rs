@@ -1,10 +1,12 @@
 #![feature(impl_trait_in_assoc_type)]
 
 mod client;
+mod conn_pool;
+mod connection;
 mod crates_api;
-mod tui;
-mod hyper_tls;
 mod discovery;
+mod hyper_tls;
+mod tui;
 use client::{Client, Receiver};
 pub use crates_api::InfoErr;
 pub use tui::FilterReason;

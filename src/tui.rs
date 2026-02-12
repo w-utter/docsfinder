@@ -64,12 +64,78 @@ impl SendRecvState {
 
     pub fn update(
         &mut self,
-        max_screen_entries: usize,
         filters: &Filters,
+        notifications: &mut Notifications,
     ) -> Result<Info, bool> {
+        //self.inflight_count = max_screen_entries.checked_sub(self.received_count).unwrap_or_default();
+
+        let info = self.info_rx.recv().ok_or(false)?;
+
+        let info = match info {
+            Ok(info) => info,
+            Err(e) => {
+                /*
+                use ratatui_notifications::Timing;
+                use std::time::Duration;
+                let notification = ratatui_notifications::Notification::new(format!("{e:?}"))
+                    .title("Error")
+                    .level(ratatui_notifications::Level::Error)
+                    .anchor(ratatui_notifications::Anchor::TopLeft)
+                    .animation(ratatui_notifications::Animation::Fade)
+                    .timing(Timing::Fixed(Duration::ZERO), Timing::default(), Timing::Fixed(Duration::ZERO))
+                    .style(Style::new()
+                    .fg(colors.row_fg)
+                    .bg(colors.buffer_bg))
+                    .build().unwrap();
+                */
+
+                notifications.append(e.into());
+
+                //let _ = notifications.add(notification);
+                return Err(true);
+            }
+        };
+
+        if let Some(reason) = filters.filter(&info) {
+            /*
+            use ratatui_notifications::Timing;
+            use std::time::Duration;
+            let notification = ratatui_notifications::Notification::new()
+                .title("Skipped Entry")
+                .level(ratatui_notifications::Level::Error)
+                .anchor(ratatui_notifications::Anchor::TopLeft)
+                .animation(ratatui_notifications::Animation::Fade)
+                .timing(Timing::Fixed(Duration::ZERO), Timing::default(), Timing::Fixed(Duration::ZERO))
+                .style(Style::new()
+                .fg(colors.row_fg)
+                .bg(colors.buffer_bg))
+
+                .build().unwrap();
+
+            //let _ = notifications.add(notification);
+            */
+            notifications.append(WarningLevel::Info(format!(
+                "skipping {} as {reason:?}",
+                info.name
+            )));
+            return Err(true);
+        }
+        Ok(info)
+    }
+
+    fn set_received_count(&mut self, received: usize) {
+        self.received_count = received;
+    }
+
+    fn update_iter<'a>(
+        &'a mut self,
+        max_screen_entries: usize,
+        filters: &'a Filters,
+        notifications: &'a mut Notifications,
+    ) -> Option<UpdateIter<'a>> {
         if self.received_count >= max_screen_entries {
             self.inflight_count = 0;
-            return Err(false);
+            return None;
         }
 
         let to_send = max_screen_entries
@@ -80,61 +146,32 @@ impl SendRecvState {
             let _ = self.send_tx.send(());
         }
 
-        self.inflight_count += to_send;
-
-        let info = self.info_rx.recv().ok_or(false)?;
-
-        self.inflight_count = self.inflight_count.checked_sub(1).unwrap_or_default();
-
-        let info = match info {
-            Ok(info) => info,
-            Err(_e) => {
-                //FIXME: log info err
-                return Err(true);
-            }
-        };
-
-        if let Some(_reason) = filters.filter(&info) {
-            // FIXME: log skipped
-            return Err(true);
-        }
-        Ok(info)
-    }
-
-    fn set_received_count(&mut self, received: usize) {
-        self.received_count = received;
-    }
-
-    fn update_iter<'a>(&'a mut self,
-        max_screen_entries: usize,
-        filters: &'a Filters,
-                   ) -> UpdateIter<'a> {
-        UpdateIter {
+        Some(UpdateIter {
             state: self,
-            max_screen_entries,
             filters,
-            has_update: false,
-        }
+            notifications,
+            update_count: 0,
+        })
     }
 }
 
 struct UpdateIter<'a> {
     state: &'a mut SendRecvState,
     filters: &'a Filters,
-    max_screen_entries: usize,
-    has_update: bool,
+    notifications: &'a mut Notifications,
+    update_count: usize,
 }
 
-impl <'a> Iterator for UpdateIter<'a> {
+impl<'a> Iterator for UpdateIter<'a> {
     type Item = Info;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.state.update(self.max_screen_entries, &self.filters) {
+            match self.state.update(&self.filters, &mut self.notifications) {
                 Ok(info) => {
-                    self.has_update = true;
+                    self.update_count += 1;
                     return Some(info);
                 }
-                Err(true) => self.has_update = true,
+                Err(true) => self.update_count += 1,
                 Err(false) => return None,
             }
         }
@@ -343,7 +380,9 @@ impl Entries {
             self.inner.sort_by(|a, b| {
                 use std::cmp::Ordering;
                 match (a, b) {
-                    (Ok(_), Ok(_)) | (Err(Some(_)), Err(Some(_))) | (Err(None), Err(None)) => Ordering::Equal,
+                    (Ok(_), Ok(_)) | (Err(Some(_)), Err(Some(_))) | (Err(None), Err(None)) => {
+                        Ordering::Equal
+                    }
                     (Ok(_), _) => Ordering::Less,
                     (_, Ok(_)) => Ordering::Greater,
                     (Err(Some(_)), _) => Ordering::Less,
@@ -368,6 +407,7 @@ pub struct App {
     prev_max_info_width: usize,
     menu_state: MenuState,
     hide_footer: bool,
+    notifications: Notifications,
 }
 
 #[derive(Clone, Copy)]
@@ -462,9 +502,14 @@ impl CurrentMenu {
                 let keywords_available_y = area.height.checked_sub(1 + 1 + 3).unwrap_or_default();
                 let keywords_available_x = area.width.checked_sub(2).unwrap_or_default();
 
-                let lines = textwrap::wrap(this.filters.keywords_text.as_str(), keywords_available_x as usize).len() as u16;
+                let lines = textwrap::wrap(
+                    this.filters.keywords_text.as_str(),
+                    keywords_available_x as usize,
+                )
+                .len() as u16;
 
-                let keywords_height = core::cmp::max(core::cmp::min(keywords_available_y, lines + 2), 3);
+                let keywords_height =
+                    core::cmp::max(core::cmp::min(keywords_available_y, lines + 2), 3);
 
                 let vertical = Layout::vertical([
                     Constraint::Length(1),
@@ -486,7 +531,7 @@ impl CurrentMenu {
                 frame.render_widget(help_message, keywords_area);
 
                 let input = Paragraph::new(this.filters.keywords_text.as_str())
-                    .wrap(Wrap {trim: true})
+                    .wrap(Wrap { trim: true })
                     .style(match (&input_mode, kind) {
                         (InputMode::Normal, SelectedFilter::Keywords) => Style::default()
                             .add_modifier(Modifier::REVERSED)
@@ -561,6 +606,15 @@ struct Filters {
 pub enum FilterReason<'a> {
     Outdated,
     Keyword(&'a str),
+}
+
+impl core::fmt::Debug for FilterReason<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Outdated => write!(f, "entry was outdated."),
+            Self::Keyword(k) => write!(f, "entry contained keyword {k}"),
+        }
+    }
 }
 
 impl Filters {
@@ -677,6 +731,10 @@ impl App {
             menu_state: MenuState::default(),
             hide_footer: false,
             overflow: vec![],
+            notifications: Notifications::new(
+                max_screen_entries,
+                std::time::Duration::from_secs(5),
+            ),
         }
     }
 
@@ -692,19 +750,31 @@ impl App {
 
     fn update_loop(&mut self) -> Result<bool> {
         loop {
-            let mut upd_iter = self.send_recv_state.update_iter(self.max_screen_entries, &self.filters);
-
-            while let Some(info) = upd_iter.next() {
-                if let Some(overflow) = self.entries.insert_info(info) {
-                    self.overflow.push(overflow);
-                } else {
-                    upd_iter.state.received_count += 1;
+            let has_update = if let Some(mut upd_iter) = self.send_recv_state.update_iter(
+                self.max_screen_entries,
+                &self.filters,
+                &mut self.notifications,
+            ) {
+                while let Some(info) = upd_iter.next() {
+                    if let Some(overflow) = self.entries.insert_info(info) {
+                        self.overflow.push(overflow);
+                    }
+                    /*
+                    else {
+                        //upd_iter.state.received_count += 1;
+                    }
+                    */
                 }
-            }
 
-            let has_update = upd_iter.has_update;
+                upd_iter.update_count > 0
+            } else {
+                false
+            };
 
             if has_update {
+                self.send_recv_state.inflight_count = 100;
+                //self.send_recv_state.inflight_count
+                //self.send_recv_state.inflight_count = self.max_screen_entries.checked_sub(self.send_recv_state.received_count).unwrap_or_default();
                 self.send_recv_state.received_count = self.entries.entries_len();
             }
 
@@ -713,7 +783,13 @@ impl App {
                 return Ok(false);
             }
 
-            if self.send_recv_state.received_count != self.entries.len() && !event::poll(Duration::from_millis(100))? {
+            if (self.send_recv_state.received_count != self.entries.len()
+                || !self.notifications.is_empty())
+                && !event::poll(Duration::from_millis(100))?
+            {
+                if !self.notifications.is_empty() {
+                    return Ok(false);
+                }
                 continue;
             }
 
@@ -756,10 +832,8 @@ impl App {
                                 }
                                 KeyCode::Char('g') | KeyCode::Char('o') => self.goto_link(),
                                 KeyCode::Char('r') => {
-                                    self.entries.clear_all(
-                                        &mut self.send_recv_state,
-                                        &mut self.overflow,
-                                    );
+                                    self.entries
+                                        .clear_all(&mut self.send_recv_state, &mut self.overflow);
                                     self.table_state.select(None);
                                 }
                                 KeyCode::Char('f') => {
@@ -779,13 +853,17 @@ impl App {
                                 }
                                 KeyCode::Char('n') => {
                                     self.max_screen_entries += 1;
+                                    self.notifications.set_max_count(self.max_screen_entries);
                                     self.entries.resize(self.max_screen_entries);
-                                    self.send_recv_state.received_count = self.entries.entries_len();
+                                    self.send_recv_state.received_count =
+                                        self.entries.entries_len();
                                 }
                                 KeyCode::Char('m') => {
                                     self.max_screen_entries -= 1;
+                                    self.notifications.set_max_count(self.max_screen_entries);
                                     self.entries.resize(self.max_screen_entries);
-                                    self.send_recv_state.received_count = self.entries.entries_len();
+                                    self.send_recv_state.received_count =
+                                        self.entries.entries_len();
                                 }
                                 _ => {}
                             }
@@ -835,10 +913,8 @@ impl App {
                                 KeyCode::Char('g') | KeyCode::Char('o') => self.goto_link(),
                                 KeyCode::Char('r') => {
                                     self.menu_state.current = None;
-                                    self.entries.clear_all(
-                                        &mut self.send_recv_state,
-                                        &mut self.overflow,
-                                    );
+                                    self.entries
+                                        .clear_all(&mut self.send_recv_state, &mut self.overflow);
                                     self.table_state.select(None);
                                 }
                                 KeyCode::Esc => {
@@ -928,7 +1004,15 @@ impl App {
 
                 let total_width = usize::try_from(area.width).unwrap();
 
-                let desc_width = total_width.checked_sub(self.prev_max_info_width + self.entries.longest_keyword_len + self.entries.longest_category_len + column_count + 3).unwrap_or_default();
+                let desc_width = total_width
+                    .checked_sub(
+                        self.prev_max_info_width
+                            + self.entries.longest_keyword_len
+                            + self.entries.longest_category_len
+                            + column_count
+                            + 3,
+                    )
+                    .unwrap_or_default();
 
                 let max_newlines = 2;
 
@@ -1038,11 +1122,11 @@ impl App {
             footer_info.push_str(", Enter: update");
         }
 
-        if matches!(
-            self.menu_state.current,
-            None
-        ) {
-            footer_info.push_str(&format!(", current entries: {} (n: inc, m: dec)", self.max_screen_entries));
+        if matches!(self.menu_state.current, None) {
+            footer_info.push_str(&format!(
+                ", current entries: {} (n: inc, m: dec)",
+                self.max_screen_entries
+            ));
         }
 
         let footer = Paragraph::new(Text::from(footer_info.as_str()))
@@ -1057,6 +1141,33 @@ impl App {
             );
         if !self.hide_footer {
             frame.render_widget(footer, footer_area);
+        }
+
+        // - 2 for the border
+        let w = (area.width / 4) - 2;
+
+        let heights = self.notifications.calculate_heights(w);
+
+        /*
+        if !heights.is_empty() {
+            panic!("{heights:?}");
+        }
+        */
+
+        let total_height = heights.iter().sum();
+
+        let vertical = Layout::vertical([Constraint::Length(total_height)]).flex(Flex::Start);
+        let horizontal = Layout::horizontal([Constraint::Length(w + 2)]).flex(Flex::Start);
+        let [area] = vertical.areas(area);
+        let [area] = horizontal.areas(area);
+
+        frame.render_widget(Clear, area); //this clears out the background
+
+        let notifs = Layout::vertical(heights.into_iter().map(|h| Constraint::Length(h)));
+        let areas = notifs.split(area);
+
+        for (area, notif) in areas.iter().zip(self.notifications.notifs()) {
+            notif.display(frame, area);
         }
     }
 
@@ -1397,5 +1508,110 @@ impl Info {
             height,
             width,
         )
+    }
+}
+
+#[derive(Debug)]
+enum WarningLevel {
+    Error(String),
+    Info(String),
+}
+
+impl From<crate::connection::CrateError> for WarningLevel {
+    fn from(f: crate::connection::CrateError) -> Self {
+        use crate::client::HttpConnectionError;
+        use crate::connection::CrateError;
+        use crate::crates_api::InfoErr;
+        let s = match f {
+            CrateError::Timeout => String::from("connection timed out"),
+            CrateError::Http(h) => match h {
+                HttpConnectionError::Ended => String::from("connection ended"),
+                HttpConnectionError::Error(h) => format!("hyper: {h}"),
+            },
+            CrateError::Crates(c) => match c {
+                InfoErr::Hyper(h) => format!("hyper: {h}"),
+                InfoErr::Api(h) => format!("crates: {h:?}"),
+                InfoErr::Io(h) => format!("io: {h}"),
+                InfoErr::Serde(h) => format!("serde: {h}"),
+                InfoErr::NotFound => String::from("crate not found"),
+            },
+        };
+        Self::Error(s)
+    }
+}
+
+impl WarningLevel {
+    fn display(&self, frame: &mut Frame, area: &Rect) {
+        let now = std::time::Instant::now();
+        let p = match self {
+            Self::Info(s) => Paragraph::new(s.as_str()).block(
+                Block::bordered()
+                    .title(format!("Info {:?}", now))
+                    .style(Style::new().fg(Color::White)),
+            ),
+            Self::Error(e) => Paragraph::new(e.as_str()).block(
+                Block::bordered()
+                    .title(format!("Error {:?}", now))
+                    .style(Style::new().fg(Color::Red)),
+            ),
+        };
+        frame.render_widget(p, *area);
+    }
+}
+
+#[derive(Debug, Default)]
+struct Notifications {
+    inner: std::collections::VecDeque<(std::time::Instant, WarningLevel)>,
+    max_count: usize,
+    show_duration: std::time::Duration,
+}
+
+impl Notifications {
+    fn new(max_count: usize, show_duration: std::time::Duration) -> Self {
+        Self {
+            max_count,
+            show_duration,
+            ..Default::default()
+        }
+    }
+
+    fn set_max_count(&mut self, max_count: usize) {
+        self.max_count = max_count;
+        self.inner.truncate(max_count);
+    }
+
+    fn append(&mut self, it: WarningLevel) {
+        self.inner.push_front((std::time::Instant::now(), it));
+        self.inner.truncate(self.max_count);
+    }
+
+    fn clear_stale_notifications(&mut self) {
+        let now = std::time::Instant::now();
+        self.inner
+            .retain(|(then, _)| now.duration_since(*then) <= self.show_duration);
+    }
+
+    fn calculate_heights(&mut self, width: u16) -> Vec<u16> {
+        self.clear_stale_notifications();
+        self.inner
+            .iter()
+            .map(|(_, wl)| {
+                let s = match wl {
+                    WarningLevel::Info(i) => i,
+                    WarningLevel::Error(e) => e,
+                };
+
+                let height = textwrap::wrap(s, width as usize).len();
+                (height + 2) as u16
+            })
+            .collect()
+    }
+
+    fn notifs(&self) -> impl Iterator<Item = &WarningLevel> {
+        self.inner.iter().map(|(_, wl)| wl)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }

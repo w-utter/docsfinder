@@ -1,8 +1,6 @@
 #[derive(Debug)]
 pub enum InfoErr {
     #[allow(unused)]
-    Http(reqwest::Error),
-    #[allow(unused)]
     Hyper(hyper::Error),
     #[allow(unused)]
     Api(crates_io_api::ApiErrors),
@@ -11,22 +9,13 @@ pub enum InfoErr {
     #[allow(unused)]
     Serde(serde_json::Error),
     NotFound,
-    Timeout,
 }
 
-impl std::error::Error for InfoErr {
-
-}
+impl std::error::Error for InfoErr {}
 
 impl std::fmt::Display for InfoErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <Self as std::fmt::Debug>::fmt(self, f)
-    }
-}
-
-impl From<reqwest::Error> for InfoErr {
-    fn from(f: reqwest::Error) -> Self {
-        Self::Http(f)
     }
 }
 
@@ -112,11 +101,10 @@ impl From<crates_io_api::CrateResponse> for Info {
     }
 }
 
-use std::sync::{LazyLock, Arc, atomic::{Ordering, AtomicBool}};
-use tokio_rustls::rustls::ClientConfig;
+use std::sync::{Arc, LazyLock};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-
+use tokio_rustls::rustls::ClientConfig;
 
 #[derive(Clone)]
 pub struct CratesManager {
@@ -129,53 +117,49 @@ impl CratesManager {
     const HTTPS_PORT: u16 = 443;
 
     pub fn new(config: Arc<ClientConfig>) -> Self {
-        Self {
-            config
-        }
+        Self { config }
     }
 }
 
-pub(crate) static PARSED_CRATES_URL: LazyLock<hyper::Uri> = LazyLock::new(|| hyper::Uri::from_static(CratesManager::CRATES_URL));
-pub(crate) static CRATES_HOSTNAME: LazyLock<rustls_pki_types::ServerName<'static>> = LazyLock::new(|| rustls_pki_types::ServerName::try_from(PARSED_CRATES_URL.host().unwrap_or_default().to_string()).unwrap());
+pub(crate) static PARSED_CRATES_URL: LazyLock<hyper::Uri> =
+    LazyLock::new(|| hyper::Uri::from_static(CratesManager::CRATES_URL));
+pub(crate) static CRATES_HOSTNAME: LazyLock<rustls_pki_types::ServerName<'static>> =
+    LazyLock::new(|| {
+        rustls_pki_types::ServerName::try_from(
+            PARSED_CRATES_URL.host().unwrap_or_default().to_string(),
+        )
+        .unwrap()
+    });
 
-impl connection_pool::ConnectionManager for CratesManager {
-    type Connection = crate::discovery::Connection;
-    type Error = InfoErr;
-    type CreateFut = impl Future<Output = Result<Self::Connection, Self::Error>> + Send;
-    type ValidFut<'a> = impl Future<Output = bool> + Send + 'a;
-    
-    fn create_connection(&self) -> Self::CreateFut {
+use crate::connection::Connection;
+
+impl crate::conn_pool::ConnectionManager for CratesManager {
+    type Conn = Connection;
+    type Error = crate::crates_api::InfoErr;
+
+    async fn create_connection(&self) -> Result<Self::Conn, Self::Error> {
         let config = self.config.clone();
-        async {
-            let parsed_url = &PARSED_CRATES_URL;
-            let host = parsed_url.host().unwrap_or_default();
+        let parsed_url = &PARSED_CRATES_URL;
+        let host = parsed_url.host().unwrap_or_default();
 
-            let connector = TlsConnector::from(config);
-            let stream = TcpStream::connect((host, Self::HTTPS_PORT)).await?;
-            let stream = connector.connect(CRATES_HOSTNAME.clone(), stream).await?;
+        let connector = TlsConnector::from(config);
+        let stream = TcpStream::connect((host, Self::HTTPS_PORT)).await?;
+        let stream = connector.connect(CRATES_HOSTNAME.clone(), stream).await?;
 
-            let io = crate::hyper_tls::Io::new(stream);
-            let (inner, conn) = hyper::client::conn::http1::handshake(io).await?;
-            let valid = Arc::new(AtomicBool::from(true));
+        let io = crate::hyper_tls::Io::new(stream);
+        let (inner, conn) = hyper::client::conn::http1::handshake(io).await?;
 
-            let is_valid = valid.clone();
-            tokio::task::spawn(async move {
-                if let Err(err) = conn.await {
-                    is_valid.store(false, Ordering::SeqCst);
-                    println!("Connection failed: {:?}", err);
-                }
-            });
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
-            Ok(crate::discovery::Connection {
-                inner,
-                valid,
-            })
-        }
-    }
+        use crate::client::HttpConnectionError;
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                let _ = tx.send(HttpConnectionError::Error(err));
+            } else {
+                let _ = tx.send(HttpConnectionError::Ended);
+            }
+        });
 
-    fn is_valid<'a>(&'a self, conn: &'a mut Self::Connection) -> Self::ValidFut<'a> {
-        async {
-            conn.valid.load(Ordering::Relaxed) && !conn.inner.is_closed()
-        }
+        Ok(Connection { inner, notify: rx })
     }
 }
