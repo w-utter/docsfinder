@@ -67,53 +67,17 @@ impl SendRecvState {
         filters: &Filters,
         notifications: &mut Notifications,
     ) -> Result<Info, bool> {
-        //self.inflight_count = max_screen_entries.checked_sub(self.received_count).unwrap_or_default();
-
         let info = self.info_rx.recv().ok_or(false)?;
 
         let info = match info {
             Ok(info) => info,
             Err(e) => {
-                /*
-                use ratatui_notifications::Timing;
-                use std::time::Duration;
-                let notification = ratatui_notifications::Notification::new(format!("{e:?}"))
-                    .title("Error")
-                    .level(ratatui_notifications::Level::Error)
-                    .anchor(ratatui_notifications::Anchor::TopLeft)
-                    .animation(ratatui_notifications::Animation::Fade)
-                    .timing(Timing::Fixed(Duration::ZERO), Timing::default(), Timing::Fixed(Duration::ZERO))
-                    .style(Style::new()
-                    .fg(colors.row_fg)
-                    .bg(colors.buffer_bg))
-                    .build().unwrap();
-                */
-
                 notifications.append(e.into());
-
-                //let _ = notifications.add(notification);
                 return Err(true);
             }
         };
 
         if let Some(reason) = filters.filter(&info) {
-            /*
-            use ratatui_notifications::Timing;
-            use std::time::Duration;
-            let notification = ratatui_notifications::Notification::new()
-                .title("Skipped Entry")
-                .level(ratatui_notifications::Level::Error)
-                .anchor(ratatui_notifications::Anchor::TopLeft)
-                .animation(ratatui_notifications::Animation::Fade)
-                .timing(Timing::Fixed(Duration::ZERO), Timing::default(), Timing::Fixed(Duration::ZERO))
-                .style(Style::new()
-                .fg(colors.row_fg)
-                .bg(colors.buffer_bg))
-
-                .build().unwrap();
-
-            //let _ = notifications.add(notification);
-            */
             notifications.append(WarningLevel::Info(format!(
                 "skipping {} as {reason:?}",
                 info.name
@@ -595,11 +559,13 @@ struct MenuState {
     current: Option<(CurrentMenu, InputMode)>,
 }
 
-#[derive(Default)]
+#[derive(Default, savefile_derive::Savefile)]
 struct Filters {
     max_update: Option<std::time::Duration>,
     keywords: HashSet<String>,
+    #[savefile_ignore]
     keywords_text: String,
+    #[savefile_ignore]
     duration_text: String,
 }
 
@@ -618,6 +584,34 @@ impl core::fmt::Debug for FilterReason<'_> {
 }
 
 impl Filters {
+    const FILTER_SAVE_PATH: &str = "filter_data.bin";
+    const FILTER_VERSION: u32 = 1;
+
+    fn load_or_default() -> Self {
+        if let Ok(mut filters) =
+            savefile::load_file::<Self, _>(Self::FILTER_SAVE_PATH, Self::FILTER_VERSION)
+        {
+            let buf = filters
+                .keywords
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            filters.keywords_text = buf;
+            if let Some(dur) = filters.max_update {
+                filters.duration_text = humantime::format_duration(dur).to_string();
+            }
+
+            filters
+        } else {
+            Default::default()
+        }
+    }
+
+    fn save_to_file(&self) {
+        savefile::save_file(Self::FILTER_SAVE_PATH, Self::FILTER_VERSION, self).unwrap()
+    }
+
     fn filter<'a>(&self, info: &'a Info) -> Option<FilterReason<'a>> {
         if let Some(max_dur) = self.max_update.as_ref() {
             let now = chrono::Utc::now();
@@ -726,7 +720,7 @@ impl App {
             entries: Entries::new(max_screen_entries),
             table_state: ratatui::widgets::TableState::default(),
             colors: TableColors::new(&tailwind::STONE),
-            filters: Filters::default(),
+            filters: Filters::load_or_default(),
             prev_max_info_width: 0,
             menu_state: MenuState::default(),
             hide_footer: false,
@@ -743,9 +737,11 @@ impl App {
             terminal.draw(|frame| self.draw(frame))?;
 
             if self.update_loop()? {
-                return Ok(());
+                break;
             }
         }
+        self.filters.save_to_file();
+        Ok(())
     }
 
     fn update_loop(&mut self) -> Result<bool> {
@@ -759,11 +755,6 @@ impl App {
                     if let Some(overflow) = self.entries.insert_info(info) {
                         self.overflow.push(overflow);
                     }
-                    /*
-                    else {
-                        //upd_iter.state.received_count += 1;
-                    }
-                    */
                 }
 
                 upd_iter.update_count > 0
@@ -772,9 +763,10 @@ impl App {
             };
 
             if has_update {
-                self.send_recv_state.inflight_count = 100;
-                //self.send_recv_state.inflight_count
-                //self.send_recv_state.inflight_count = self.max_screen_entries.checked_sub(self.send_recv_state.received_count).unwrap_or_default();
+                self.send_recv_state.inflight_count = self
+                    .max_screen_entries
+                    .checked_sub(self.send_recv_state.received_count)
+                    .unwrap_or_default();
                 self.send_recv_state.received_count = self.entries.entries_len();
             }
 
@@ -1147,12 +1139,6 @@ impl App {
         let w = (area.width / 4) - 2;
 
         let heights = self.notifications.calculate_heights(w);
-
-        /*
-        if !heights.is_empty() {
-            panic!("{heights:?}");
-        }
-        */
 
         let total_height = heights.iter().sum();
 
@@ -1542,16 +1528,17 @@ impl From<crate::connection::CrateError> for WarningLevel {
 
 impl WarningLevel {
     fn display(&self, frame: &mut Frame, area: &Rect) {
-        let now = std::time::Instant::now();
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+
         let p = match self {
-            Self::Info(s) => Paragraph::new(s.as_str()).block(
+            Self::Info(s) => Paragraph::new(s.as_str()).wrap(Wrap { trim: true }).block(
                 Block::bordered()
-                    .title(format!("Info {:?}", now))
+                    .title(format!("Info {}", now))
                     .style(Style::new().fg(Color::White)),
             ),
-            Self::Error(e) => Paragraph::new(e.as_str()).block(
+            Self::Error(e) => Paragraph::new(e.as_str()).wrap(Wrap { trim: true }).block(
                 Block::bordered()
-                    .title(format!("Error {:?}", now))
+                    .title(format!("Error {}", now))
                     .style(Style::new().fg(Color::Red)),
             ),
         };

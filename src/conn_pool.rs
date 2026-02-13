@@ -89,12 +89,6 @@ impl<T: ConnectionManager> ConnPool<T> {
             return Ok(Connection::new(conn, &self.connections));
         }
 
-        /*
-        match self.manager.create_connection().await {
-            Ok(conn) => Ok(Connection::new(conn, &self.connections)),
-            Err(e) => Err(ConnectionError::Creation(e)),
-        }
-        */
         match tokio::time::timeout(self.timeout_duration, self.manager.create_connection()).await {
             Ok(Ok(conn)) => {
                 return Ok(Connection::new(conn, &self.connections));

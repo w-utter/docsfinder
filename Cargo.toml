@@ -52,3 +52,7 @@ pin-project-lite = "0.2"
 lockfree = "0.5"
 
 ratatui-notifications = "0.1.0"
+
+savefile = "0.20"
+savefile-derive = "0.20"
+
